@@ -59,7 +59,7 @@ version = "0.9.1"
 dependencies = [
  "assert_matches",
  "astral-reqwest-middleware",
- "async_zip",
+ "astral_async_zip",
  "axum",
  "bisection",
  "futures",
@@ -78,6 +78,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astral_async_zip"
+version = "0.0.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab72a761e6085828cc8f0e05ed332b2554701368c5dc54de551bfaec466518ba"
+dependencies = [
+ "crc32fast",
+ "futures-lite",
+ "pin-project",
+ "thiserror 1.0.65",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,20 +100,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "async_zip"
-version = "0.0.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b9f7252833d5ed4b00aa9604b563529dd5e11de9c23615de2dcdf91eb87b52"
-dependencies = [
- "crc32fast",
- "futures-lite",
- "pin-project",
- "thiserror 1.0.65",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
