@@ -186,10 +186,6 @@ impl AsyncHttpRangeReader {
                 reqwest::header::RANGE,
                 format!("bytes=-{initial_chunk_size}"),
             )
-            .header(
-                reqwest::header::ACCEPT_ENCODING,
-                reqwest::header::HeaderValue::from_static("identity"),
-            )
             .headers(extra_headers)
             .send()
             .await
@@ -292,10 +288,6 @@ impl AsyncHttpRangeReader {
         // Perform a HEAD request to get the content-length.
         let head_response = client
             .head(url.clone())
-            .header(
-                reqwest::header::ACCEPT_ENCODING,
-                reqwest::header::HeaderValue::from_static("identity"),
-            )
             .headers(extra_headers)
             .send()
             .await
@@ -479,10 +471,6 @@ async fn run_streamer(
             let response = match client
                 .get(url.clone())
                 .header(reqwest::header::RANGE, range_string)
-                .header(
-                    reqwest::header::ACCEPT_ENCODING,
-                    reqwest::header::HeaderValue::from_static("identity"),
-                )
                 .headers(extra_headers.clone())
                 .send()
                 .instrument(span)
