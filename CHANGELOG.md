@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/astral-sh/async_http_range_reader/compare/v0.9.1...v0.10.0) - 2026-02-09
+
+### Other
+
+- Modernize release-plz setup
+- Update thiserror and itertools
+- Update lockfile
+- Rustfmt
+- Revert "update lib.rs set accept-encoding: identity to prevent double-compression"
+- update lib.rs set accept-encoding: identity to prevent double-compression
+- update README to reflect astral-forked package
+- new clippy notes: port updates from prefix-dev/async_http_range_reader
+- update reqwest to 0.13.1, reqwest-middleware to 0.5.0
+
 ## [0.9.1](https://github.com/prefix-dev/async_http_range_reader/compare/v0.9.0...v0.9.1) - 2024-11-12
 
 ### Other
