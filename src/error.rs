@@ -32,8 +32,12 @@ pub enum AsyncHttpRangeReaderError {
     MemoryMapError(#[source] Arc<std::io::Error>),
 
     /// Error from `http-content-range`
-    #[error("Invalid Content-Range header: {0}")]
+    #[error("invalid Content-Range header: {0}")]
     ContentRangeParser(String),
+
+    /// The server returned fewer or more bytes than the range request asked for
+    #[error("expected {expected} bytes from range response, got {actual}")]
+    ContentLengthMismatch { expected: u64, actual: u64 },
 }
 
 impl From<std::io::Error> for AsyncHttpRangeReaderError {
