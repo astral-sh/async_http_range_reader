@@ -50,7 +50,7 @@ pub use error::AsyncHttpRangeReaderError;
 /// The general entrypoint is [`AsyncHttpRangeReader::new`]. Depending on the
 /// [`CheckSupportMethod`], this will either call [`AsyncHttpRangeReader::initial_tail_request`] or
 /// [`AsyncHttpRangeReader::initial_head_request`] to send the initial request and then
-/// [`AsyncHttpRangeReader::from_tail_response`] or [`AsyncHttpRangeReader::from_head_response`] to
+/// [`AsyncHttpRangeReader::from_range_response`] or [`AsyncHttpRangeReader::from_head_response`] to
 /// initialize the async reader. If you want to apply a caching layer, you can send the initial head
 /// (or tail) request yourself with your cache headers (e.g. through the
 /// [http-cache-semantics](https://docs.rs/http-cache-semantics) crate):
@@ -158,7 +158,7 @@ impl AsyncHttpRangeReader {
                 )
                 .await?;
                 let response_headers = response.headers().clone();
-                let self_ = Self::from_tail_response(client, response, url, extra_headers).await?;
+                let self_ = Self::from_range_response(client, response, url, extra_headers).await?;
                 Ok((self_, response_headers))
             }
             CheckSupportMethod::Head => {
@@ -197,18 +197,28 @@ impl AsyncHttpRangeReader {
         Ok(tail_response)
     }
 
-    /// Initialize the reader from [`AsyncHttpRangeReader::initial_tail_request`] (or a user
-    /// provided range response)
+    #[deprecated(note = "use `from_range_response` instead")]
     pub async fn from_tail_response(
         client: impl Into<reqwest_middleware::ClientWithMiddleware>,
         tail_request_response: Response,
         url: Url,
         extra_headers: HeaderMap,
     ) -> Result<Self, AsyncHttpRangeReaderError> {
+        Self::from_range_response(client, tail_request_response, url, extra_headers).await
+    }
+
+    /// Initialize the reader from [`AsyncHttpRangeReader::initial_tail_request`] (or a user
+    /// provided range response)
+    pub async fn from_range_response(
+        client: impl Into<reqwest_middleware::ClientWithMiddleware>,
+        response: Response,
+        url: Url,
+        extra_headers: HeaderMap,
+    ) -> Result<Self, AsyncHttpRangeReaderError> {
         let client = client.into();
 
         // Get the size of the file from this initial request
-        let content_range_header = tail_request_response
+        let content_range_header = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .ok_or(AsyncHttpRangeReaderError::ContentRangeMissing)?
@@ -251,7 +261,7 @@ impl AsyncHttpRangeReader {
             client,
             url,
             extra_headers,
-            Some((tail_request_response, start, end_inclusive + 1)),
+            Some((response, start, end_inclusive + 1)),
             memory_map,
             state_tx,
             request_rx,
@@ -300,7 +310,7 @@ impl AsyncHttpRangeReader {
     }
 
     /// Initialize the reader from [`AsyncHttpRangeReader::initial_head_request`] (or a user
-    /// provided response the)
+    /// provided response)
     pub async fn from_head_response(
         client: impl Into<reqwest_middleware::ClientWithMiddleware>,
         head_response: Response,
@@ -418,14 +428,14 @@ async fn run_streamer(
     client: reqwest_middleware::ClientWithMiddleware,
     url: Url,
     extra_headers: HeaderMap,
-    initial_tail_response: Option<(Response, u64, u64)>,
+    response: Option<(Response, u64, u64)>,
     mut memory_map: MmapMut,
     mut state_tx: Sender<StreamerState>,
     mut request_rx: tokio::sync::mpsc::Receiver<Range<u64>>,
 ) {
     let mut state = StreamerState::default();
 
-    if let Some((response, start, end_exclusive)) = initial_tail_response {
+    if let Some((response, start, end_exclusive)) = response {
         // Add the initial range to the state
         state.requested_ranges.push(start..end_exclusive);
 
@@ -487,6 +497,14 @@ async fn run_streamer(
                 Ok(response) => response,
             };
 
+            if let Err(err) =
+                validate_content_range(&response, *range.start(), *range.end(), memory_map.len())
+            {
+                state.error = Some(err);
+                let _ = state_tx.send(state);
+                break 'outer;
+            }
+
             // If the server returns a successful, but non-206 response (e.g., 200), then it
             // doesn't support range requests (even if the `Accept-Ranges` header is set).
             if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -509,6 +527,47 @@ async fn run_streamer(
             }
         }
     }
+}
+
+/// Ensure that the response range headers match the request range headers
+fn validate_content_range(
+    response: &Response,
+    expected_start: u64,
+    expected_end_inclusive: u64,
+    expected_complete_length: usize,
+) -> Result<(), AsyncHttpRangeReaderError> {
+    let content_range_header = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .ok_or(AsyncHttpRangeReaderError::ContentRangeMissing)?
+        .to_str()
+        .map_err(|_err| AsyncHttpRangeReaderError::ContentRangeMissing)?;
+    let content_range = ContentRange::parse(content_range_header).ok_or_else(|| {
+        AsyncHttpRangeReaderError::ContentRangeParser(content_range_header.to_string())
+    })?;
+    let (actual_start, actual_end_inclusive, actual_complete_length) = match content_range {
+        ContentRange::Bytes(ContentRangeBytes {
+            first_byte,
+            last_byte,
+            complete_length,
+        }) => (first_byte, last_byte, complete_length),
+        _ => return Err(AsyncHttpRangeReaderError::HttpRangeRequestUnsupported),
+    };
+    if expected_start != actual_start
+        || expected_end_inclusive != actual_end_inclusive
+        || expected_complete_length as u64 != actual_complete_length
+    {
+        return Err(AsyncHttpRangeReaderError::RangeMismatch {
+            expected_start,
+            expected_end_inclusive,
+            expected_complete_length,
+            actual_start,
+            actual_end_inclusive,
+            actual_complete_length,
+        });
+    }
+
+    Ok(())
 }
 
 /// Streams the data from the specified response to the memory map updating progress in between.
@@ -552,9 +611,8 @@ async fn stream_response(
 
         // Prevent the server from sending more bytes than advertised in a response
         if offset > end_exclusive {
-            state.error = Some(AsyncHttpRangeReaderError::ContentLengthMismatch {
+            state.error = Some(AsyncHttpRangeReaderError::ResponseTooLong {
                 expected: end_exclusive - start,
-                actual: offset - start,
             });
             let _ = state_tx.send(state.clone());
             return false;
@@ -577,7 +635,7 @@ async fn stream_response(
 
     // Prevent the server from sending less bytes than advertised in a response
     if offset != end_exclusive {
-        state.error = Some(AsyncHttpRangeReaderError::ContentLengthMismatch {
+        state.error = Some(AsyncHttpRangeReaderError::ResponseTooShort {
             expected: end_exclusive - start,
             actual: offset - start,
         });
@@ -955,25 +1013,83 @@ mod test {
     /// the memory map.
     #[tokio::test]
     async fn test_content_length_response_beyond_content_length() {
-        let cases = [
+        /// Extract the [`AsyncHttpRangeReaderError`] from an `io::Error` returned by `read`.
+        fn into_range_error(err: std::io::Error) -> AsyncHttpRangeReaderError {
+            err.into_inner()
+                .unwrap()
+                .downcast::<AsyncHttpRangeReaderError>()
+                .map(|e| *e)
+                .unwrap()
+        }
+
+        let cases: Vec<(usize, usize, usize, Option<AsyncHttpRangeReaderError>)> = vec![
             // Baseline
-            (512, 512, 512, true),
+            (512, 512, 512, None),
             // The requested and declared length is 512, while the actual content is 1024
-            (512, 512, 1024, false),
+            (
+                512,
+                512,
+                1024,
+                Some(AsyncHttpRangeReaderError::ResponseTooLong { expected: 512 }),
+            ),
             // The declared total length is 512, but it says and sends a range of 1024
-            (512, 1024, 1024, false),
-            // We ignore the response range end header is lying, we're getting the 512 we ordered
-            (512, 1024, 512, true),
+            (
+                512,
+                1024,
+                1024,
+                Some(AsyncHttpRangeReaderError::ContentRangeParser(
+                    "bytes 0-1023/512".to_string(),
+                )),
+            ),
+            // The declared total length is 512, but it says a range of 1024
+            (
+                512,
+                1024,
+                512,
+                Some(AsyncHttpRangeReaderError::ContentRangeParser(
+                    "bytes 0-1023/512".to_string(),
+                )),
+            ),
             // Baseline
-            (1024, 512, 512, true),
+            (1024, 512, 512, None),
             // We requested 512, but we're getting 1024
-            (1024, 512, 1024, false),
+            (
+                1024,
+                512,
+                1024,
+                Some(AsyncHttpRangeReaderError::ResponseTooLong { expected: 512 }),
+            ),
             // We requested 512, but we're getting 1024
-            (1024, 1024, 1024, false),
-            // We ignore the response range end header is lying, we're getting the 512 we ordered
-            (1024, 1024, 512, true),
+            (
+                1024,
+                1024,
+                1024,
+                Some(AsyncHttpRangeReaderError::RangeMismatch {
+                    expected_start: 0,
+                    expected_end_inclusive: 511,
+                    expected_complete_length: 1024,
+                    actual_start: 0,
+                    actual_end_inclusive: 1023,
+                    actual_complete_length: 1024,
+                }),
+            ),
+            // We requested 512, but the header says 1024
+            (
+                1024,
+                1024,
+                512,
+                Some(AsyncHttpRangeReaderError::RangeMismatch {
+                    expected_start: 0,
+                    expected_end_inclusive: 511,
+                    expected_complete_length: 1024,
+                    actual_start: 0,
+                    actual_end_inclusive: 1023,
+                    actual_complete_length: 1024,
+                }),
+            ),
         ];
-        for (head_content_length, range_header_length, range_actual_length, is_ok) in cases {
+        for (head_content_length, range_header_length, range_actual_length, expected_error) in cases
+        {
             let url = spawn_mismatch_server(
                 head_content_length,
                 range_header_length,
@@ -995,18 +1111,20 @@ mod test {
 
             let mut buf = vec![0u8; 512];
             let result = reader.read(&mut buf).await;
-            if is_ok {
-                assert_matches!(
-                    result,
-                    Ok(_),
-                    "{head_content_length} {range_header_length} {range_actual_length}"
-                );
-            } else {
-                assert_matches!(
-                    result,
-                    Err(_),
-                    "{head_content_length} {range_header_length} {range_actual_length}"
-                );
+            let label =
+                format!("{head_content_length} {range_header_length} {range_actual_length}");
+            match expected_error {
+                None => {
+                    assert_matches!(result, Ok(_), "{label}");
+                }
+                Some(expected) => {
+                    // The nested error don't support `PartialEq`
+                    assert_eq!(
+                        into_range_error(result.unwrap_err()).to_string(),
+                        expected.to_string(),
+                        "{label}"
+                    );
+                }
             }
         }
     }

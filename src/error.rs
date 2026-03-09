@@ -35,9 +35,28 @@ pub enum AsyncHttpRangeReaderError {
     #[error("invalid Content-Range header: {0}")]
     ContentRangeParser(String),
 
-    /// The server returned fewer or more bytes than the range request asked for
+    /// The server returned an invalid range response
+    #[error(
+        "request and response range mismatch, \
+        expected {expected_start}-{expected_end_inclusive}/{expected_complete_length}, \
+        got {actual_start}-{actual_end_inclusive}/{actual_complete_length}"
+    )]
+    RangeMismatch {
+        expected_start: u64,
+        expected_end_inclusive: u64,
+        expected_complete_length: usize,
+        actual_start: u64,
+        actual_end_inclusive: u64,
+        actual_complete_length: u64,
+    },
+
+    /// The server returned more bytes than the range request asked for
+    #[error("range response returned more than the expected {expected} bytes")]
+    ResponseTooLong { expected: u64 },
+
+    /// The server returned fewer bytes than the range request asked for
     #[error("expected {expected} bytes from range response, got {actual}")]
-    ContentLengthMismatch { expected: u64, actual: u64 },
+    ResponseTooShort { expected: u64, actual: u64 },
 }
 
 impl From<std::io::Error> for AsyncHttpRangeReaderError {
