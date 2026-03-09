@@ -427,7 +427,7 @@ async fn run_streamer(
 
     if let Some((response, start, end_exclusive)) = initial_tail_response {
         // Add the initial range to the state
-        state.requested_ranges.push(start..memory_map.len() as u64);
+        state.requested_ranges.push(start..end_exclusive);
 
         // Stream the initial data in memory
         if !stream_response(
