@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/astral-sh/async_http_range_reader/compare/v0.10.0...v0.11.0) - 2026-03-31
+
+### Added
+
+- Migrate off bisect ([#10](https://github.com/astral-sh/async_http_range_reader/pull/10))
+
+### Fixed
+
+- Declare error type as non_exhaustive ([#13](https://github.com/astral-sh/async_http_range_reader/pull/13))
+
+### Other
+
+- Merge upstream main ([#12](https://github.com/astral-sh/async_http_range_reader/pull/12))
+- Switch async_zip dev-dependency to astral_async_zip
+- Update rstest dev-dependency to 0.26
+- Merge pull request #8 from astral-sh/konsti/bounds-checks
+- Fix clippy
+- release v0.10.0
+
 ## [0.10.0](https://github.com/astral-sh/async_http_range_reader/compare/v0.9.1...v0.10.0) - 2026-02-09
 
 ### Other
