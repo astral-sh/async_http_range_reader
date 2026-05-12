@@ -23,6 +23,8 @@ jobs:
       - &install-rust
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
       - name: Run release-plz
         uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5.129
         with:
