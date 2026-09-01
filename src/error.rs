@@ -28,12 +28,12 @@ pub enum AsyncHttpRangeReaderError {
     #[error("content-length header is missing from response")]
     ContentLengthMissing,
 
-    /// Memory mapping the file failed
+    /// The file is too large for this platform (retained under its original name for compatibility).
     #[error("memory mapping the file failed")]
     MemoryMapError(#[source] Arc<std::io::Error>),
 
     /// An internal lock was poisoned by a panic
-    #[error("memory map lock poisoned")]
+    #[error("range cache lock poisoned")]
     LockPoisoned,
 
     /// Error from `http-content-range`
