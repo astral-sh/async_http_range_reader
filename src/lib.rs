@@ -146,6 +146,15 @@ impl SharedCache {
         })
     }
 
+    /// Add a chunk of bytes starting at the given offset.
+    fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), AsyncHttpRangeReaderError> {
+        let Ok(mut chunks) = self.chunks.lock() else {
+            return Err(AsyncHttpRangeReaderError::LockPoisoned);
+        };
+        chunks.entry(offset).or_default().extend_from_slice(bytes);
+        Ok(())
+    }
+
     /// Read a range of bytes known to be part of the storage.
     ///
     /// This includes reads across chunk boundaries.
@@ -677,20 +686,14 @@ async fn stream_response(
 
         offset += bytes.len() as u64;
 
-        // Copy into one growing buffer rather than retaining potentially large HTTP allocations.
-        {
-            let mut chunks = match data.chunks.lock() {
-                Ok(chunks) => chunks,
-                Err(_) => {
-                    state.error = Some(AsyncHttpRangeReaderError::LockPoisoned);
-                    let _ = state_tx.send(state.clone());
-                    return false;
-                }
-            };
-            chunks
-                .entry(start as usize)
-                .or_default()
-                .extend_from_slice(&bytes);
+        // Copy into one growing buffer as we go, reusing the same buffer through identical `start`.
+        match data.write(start as usize, &bytes) {
+            Ok(()) => {}
+            Err(err) => {
+                state.error = Some(err);
+                let _ = state_tx.send(state.clone());
+                return false;
+            }
         }
 
         // Update the range of bytes that have been downloaded
@@ -832,7 +835,7 @@ mod test {
     use crate::static_directory_server::StaticDirectoryServer;
     use assert_matches::assert_matches;
     use async_zip::tokio::read::seek::ZipFileReader;
-    use axum::body::{Body, Bytes};
+    use axum::body::Body;
     use axum::extract::Request;
     use axum::response::IntoResponse;
     use futures::AsyncReadExt;
@@ -843,20 +846,16 @@ mod test {
     use std::path::Path;
     use std::time::Duration;
     use tokio::io::AsyncReadExt as _;
-    use tokio::io::AsyncSeekExt;
 
     #[test]
     fn sparse_cache_reads_across_chunks() {
         // A few bytes at the end of a huge file must not allocate storage for the holes.
         let cache = SharedCache::new(isize::MAX as u64).unwrap();
         let start = cache.len - 16;
-        {
-            let mut chunks = cache.chunks.lock().unwrap();
-            chunks.insert(start + 8, b"89ab".to_vec());
-            chunks.insert(0, b"other range".to_vec());
-            chunks.insert(start, b"0123".to_vec());
-            chunks.insert(start + 4, b"4567".to_vec());
-        }
+        cache.write(start + 8, b"89ab").unwrap();
+        cache.write(0, b"other range").unwrap();
+        cache.write(start, b"0123").unwrap();
+        cache.write(start + 4, b"4567").unwrap();
 
         let mut output = [b'?'; 10];
         let mut buf = ReadBuf::new(&mut output);
