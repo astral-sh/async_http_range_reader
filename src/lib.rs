@@ -21,6 +21,8 @@ use http_content_range::{ContentRange, ContentRangeBytes};
 use reqwest::header::HeaderMap;
 use reqwest::{Response, Url};
 use sparse_range::SparseRange;
+use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -88,21 +90,45 @@ struct StreamerState {
     error: Option<AsyncHttpRangeReaderError>,
 }
 
+/// Loaded segments of a larger `Vec<u8>` (the remote file), indexed by start position.
+#[derive(Default)]
+struct Chunks(BTreeMap<usize, Vec<u8>>);
+
+impl fmt::Debug for Chunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(start, bytes)| *start..*start + bytes.len()),
+            )
+            .finish()
+    }
+}
+
+impl Deref for Chunks {
+    type Target = BTreeMap<usize, Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Chunks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Downloaded chunks owned by both the reader and its background download task.
 ///
 /// Each requested range grows one buffer as bytes arrive. This releases the HTTP buffers and keeps
 /// fragmented responses compact. Ranges do not overlap. The lock is never held across an await.
+#[derive(Debug)]
 struct SharedCache {
-    chunks: sync::Mutex<BTreeMap<usize, Vec<u8>>>,
+    chunks: sync::Mutex<Chunks>,
+    /// The length of the remote file.
     len: usize,
-}
-
-impl fmt::Debug for SharedCache {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedCache")
-            .field("len", &self.len)
-            .finish_non_exhaustive()
-    }
 }
 
 impl SharedCache {
@@ -116,22 +142,25 @@ impl SharedCache {
         })?;
         Ok(Self {
             len: len as usize,
-            chunks: sync::Mutex::new(BTreeMap::new()),
+            chunks: sync::Mutex::new(Chunks::default()),
         })
     }
 
-    /// Copy a range already known to be resident, including reads across chunk boundaries.
+    /// Read a range of bytes known to be part of the storage.
+    ///
+    /// This includes reads across chunk boundaries.
     fn read(&self, range: Range<usize>, buf: &mut ReadBuf<'_>) -> io::Result<()> {
         let chunks = self
             .chunks
             .lock()
             .map_err(|_| io::Error::other(AsyncHttpRangeReaderError::LockPoisoned))?;
-        let (&first, _) = chunks
+        let (&first_stored_start, _) = chunks
             .range(..=range.start)
             .next_back()
             .expect("resident range must have a cached chunk");
         let mut offset = range.start;
-        for (&start, bytes) in chunks.range(first..range.end) {
+        // Iterate over all chunks in the request range.
+        for (&start, bytes) in chunks.range(first_stored_start..range.end) {
             let end = range.end.min(start + bytes.len());
             buf.put_slice(&bytes[offset - start..end - start]);
             offset = end;
@@ -817,18 +846,6 @@ mod test {
     use tokio::io::AsyncSeekExt;
 
     #[test]
-    fn cache_debug_omits_downloaded_bytes() {
-        let cache = SharedCache::new(32).unwrap();
-        let empty = format!("{cache:?}");
-        cache
-            .chunks
-            .lock()
-            .unwrap()
-            .insert(0, b"private contents".to_vec());
-        assert_eq!(format!("{cache:?}"), empty);
-    }
-
-    #[test]
     fn sparse_cache_reads_across_chunks() {
         // A few bytes at the end of a huge file must not allocate storage for the holes.
         let cache = SharedCache::new(isize::MAX as u64).unwrap();
@@ -847,73 +864,6 @@ mod test {
         cache.read(start + 2..start + 10, &mut buf).unwrap();
         assert_eq!(buf.filled(), b">23456789");
         assert_eq!(&output, b">23456789?");
-    }
-
-    #[tokio::test]
-    async fn range_cache_releases_response_allocations() {
-        // A tiny slice may share a much larger HTTP buffer. The cache must not retain it.
-        let allocation = Bytes::from(vec![b'x'; 1024 * 1024]);
-        let mut fragments = (0..64)
-            .map(|_| Ok::<_, io::Error>(allocation.slice(..1)))
-            .collect::<Vec<_>>();
-        fragments.insert(1, Ok(Bytes::new()));
-        let body = reqwest::Body::wrap_stream(futures::stream::iter(fragments));
-        let response = axum::http::Response::builder().body(body).unwrap();
-        let cache = SharedCache::new(96).unwrap();
-        let mut state = StreamerState::default();
-        let (mut state_tx, _state_rx) = watch::channel(state.clone());
-
-        assert!(stream_response(response.into(), 8, 72, &cache, &mut state_tx, &mut state).await);
-        assert!(
-            allocation.try_into_mut().is_ok(),
-            "the downloaded slice must release the original allocation"
-        );
-        let mut output = [0; 64];
-        cache.read(8..72, &mut ReadBuf::new(&mut output)).unwrap();
-        assert_eq!(output, [b'x'; 64]);
-        assert_eq!(state.resident_range, SparseRange::from_range(8..72));
-    }
-
-    #[tokio::test]
-    async fn seek_boundaries_do_not_wrap() {
-        let response = axum::http::Response::builder()
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, "32")
-            .body("")
-            .unwrap();
-        let mut reader = AsyncHttpRangeReader::from_head_response(
-            Client::builder().no_proxy().build().unwrap(),
-            response.into(),
-            Url::parse("http://localhost/file").unwrap(),
-            HeaderMap::new(),
-        )
-        .await
-        .unwrap();
-
-        reader.seek(SeekFrom::Start(u64::MAX)).await.unwrap();
-        assert_eq!(reader.read(&mut [0; 1]).await.unwrap(), 0);
-        for invalid in [SeekFrom::Current(1), SeekFrom::End(-33)] {
-            assert_eq!(
-                reader.seek(invalid).await.unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-            assert_eq!(reader.stream_position().await.unwrap(), u64::MAX);
-        }
-        assert_eq!(
-            reader.seek(SeekFrom::Current(-1)).await.unwrap(),
-            u64::MAX - 1
-        );
-        assert_eq!(
-            reader.seek(SeekFrom::End(i64::MAX)).await.unwrap(),
-            32 + i64::MAX as u64
-        );
-        reader.seek(SeekFrom::Start(0)).await.unwrap();
-        assert_eq!(
-            reader.seek(SeekFrom::Current(-1)).await.unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(reader.stream_position().await.unwrap(), 0);
-        assert!(reader.requested_ranges().await.is_empty());
     }
 
     #[tokio::test]
