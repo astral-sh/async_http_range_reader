@@ -6,7 +6,10 @@ edition = "2021"
 description = "A library for streaming reading of files over HTTP using range requests"
 license = "MIT"
 repository = "https://github.com/astral-sh/async_http_range_reader"
-exclude = ["test-data/*"]
+exclude = [
+    "release-plz.toml",
+    "test-data/*",
+]
 rust-version = "1.74"
 
 [lib]
