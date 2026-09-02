@@ -10,13 +10,8 @@
 //! background. If a read operation is reading from already (pre)fetched ranges it will stream from
 //! the internal cache instead.
 //!
-//! Internally the [`AsyncHttpRangeReader`] retains owned chunks of downloaded bytes. Unrequested
-//! parts of the file do not require memory or reserved address space.
-//!
 //! The primary use-case for this library is to be able to sparsely stream a zip archive over HTTP
 //! but its designed in a generic fashion.
-
-#![forbid(unsafe_code)]
 
 mod error;
 mod sparse_range;

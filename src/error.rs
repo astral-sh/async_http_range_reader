@@ -28,7 +28,9 @@ pub enum AsyncHttpRangeReaderError {
     #[error("content-length header is missing from response")]
     ContentLengthMissing,
 
-    /// The file is too large for this platform (retained under its original name for compatibility).
+    /// The file is too large for this platform
+    ///
+    /// (Retained under its original name for compatibility)
     #[error("memory mapping the file failed")]
     MemoryMapError(#[source] Arc<std::io::Error>),
 
