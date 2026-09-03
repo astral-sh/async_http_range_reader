@@ -96,13 +96,13 @@ struct Chunks(BTreeMap<usize, Vec<u8>>);
 
 impl fmt::Debug for Chunks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(
-                self.0
-                    .iter()
-                    .map(|(start, bytes)| *start..*start + bytes.len()),
-            )
-            .finish()
+        // Don't leak the (potentially sensitive) bytes on debug, show only the ranges for
+        // debugging.
+        let ranges = self
+            .0
+            .iter()
+            .map(|(start, bytes)| *start..*start + bytes.len());
+        f.debug_list().entries(ranges).finish()
     }
 }
 
