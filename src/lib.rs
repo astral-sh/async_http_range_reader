@@ -133,15 +133,10 @@ struct SharedCache {
 
 impl SharedCache {
     fn new(len: u64) -> Result<Self, AsyncHttpRangeReaderError> {
-        // Preserve the existing size limit and error variant, without mapping the whole file.
-        let len = isize::try_from(len).map_err(|_| {
-            AsyncHttpRangeReaderError::FailedTooLarge(Arc::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("file length of {len} bytes exceeds the platform limit"),
-            )))
-        })?;
+        // On 32-bit platforms, we only support files up to 4GB (the max of `Vec<u8>`).
+        let len = usize::try_from(len).map_err(|_| AsyncHttpRangeReaderError::FileTooLarge(len))?;
         Ok(Self {
-            len: len as usize,
+            len,
             chunks: sync::Mutex::new(Chunks::default()),
         })
     }
@@ -1146,7 +1141,7 @@ mod test {
         }
         .unwrap_err();
 
-        assert_matches!(err, AsyncHttpRangeReaderError::FailedTooLarge(_));
+        assert_matches!(err, AsyncHttpRangeReaderError::FileTooLarge(_));
     }
 
     /// Spawn a server where the HEAD response reports `head_size` bytes, and range requests always

@@ -29,8 +29,14 @@ pub enum AsyncHttpRangeReaderError {
     ContentLengthMissing,
 
     /// The file is too large for this platform.
-    #[error("the file is too large for the current platform")]
-    FailedTooLarge(#[source] Arc<std::io::Error>),
+    ///
+    /// This happens when using a file >4GB on a 32-bit platform.
+    #[error(
+        "file of {} bytes exceeds the platform limit of {} bytes",
+        _0,
+        usize::MAX
+    )]
+    FileTooLarge(u64),
 
     /// An internal lock was poisoned by a panic
     #[error("range cache lock poisoned")]
