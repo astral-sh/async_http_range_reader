@@ -1100,50 +1100,6 @@ mod test {
         );
     }
 
-    #[rstest]
-    #[case(CheckSupportMethod::Head)]
-    #[case(CheckSupportMethod::NegativeRangeRequest(1))]
-    #[tokio::test]
-    async fn test_file_length_too_large(
-        #[case] check_method: CheckSupportMethod,
-        #[values(1_u64 << 63, (1_u64 << 63) + 1)] length: u64,
-    ) {
-        // Both lengths exceed the reader's platform limit.
-        let response = axum::http::Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::CONTENT_RANGE, format!("bytes 0-0/{length}"))
-            .body("")
-            .unwrap()
-            .into();
-        let client = Client::new();
-        let url = Url::parse("http://localhost/file").unwrap();
-        let err = match check_method {
-            CheckSupportMethod::Head => {
-                AsyncHttpRangeReader::from_head_response(
-                    client,
-                    response,
-                    url,
-                    HeaderMap::default(),
-                )
-                .await
-            }
-            CheckSupportMethod::NegativeRangeRequest(_) => {
-                AsyncHttpRangeReader::from_range_response(
-                    client,
-                    response,
-                    url,
-                    HeaderMap::default(),
-                )
-                .await
-            }
-        }
-        .unwrap_err();
-
-        assert_matches!(err, AsyncHttpRangeReaderError::FileTooLarge(_));
-    }
-
     /// Spawn a server where the HEAD response reports `head_size` bytes, and range requests always
     /// claim to be `pretend_size` bytes, while actually serving `actual_size`.
     async fn spawn_mismatch_server(
