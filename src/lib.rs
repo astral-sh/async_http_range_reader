@@ -10,9 +10,6 @@
 //! background. If a read operation is reading from already (pre)fetched ranges it will stream from
 //! the internal cache instead.
 //!
-//! Internally the [`AsyncHttpRangeReader`] stores a memory map which allows sparsely reading the
-//! data into memory without actually requiring all memory for file to be resident in memory.
-//!
 //! The primary use-case for this library is to be able to sparsely stream a zip archive over HTTP
 //! but its designed in a generic fashion.
 
@@ -21,11 +18,14 @@ mod sparse_range;
 
 use futures::{FutureExt, Stream, StreamExt};
 use http_content_range::{ContentRange, ContentRangeBytes};
-use memmap2::MmapMut;
 use reqwest::header::HeaderMap;
 use reqwest::{Response, Url};
 use sparse_range::SparseRange;
+use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::{
+    collections::BTreeMap,
+    fmt,
     io::{self, SeekFrom},
     ops::Range,
     pin::Pin,
@@ -90,30 +90,115 @@ struct StreamerState {
     error: Option<AsyncHttpRangeReaderError>,
 }
 
-/// A mapping owned by both the reader and its background download task.
+/// Loaded segments of a larger `Vec<u8>` (the remote file), indexed by start position.
+#[derive(Default)]
+struct Chunks(BTreeMap<usize, Vec<u8>>);
+
+impl fmt::Debug for Chunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Don't leak the (potentially sensitive) bytes on debug, show only the ranges for
+        // debugging.
+        let ranges = self
+            .0
+            .iter()
+            .map(|(start, bytes)| *start..*start + bytes.len());
+        f.debug_list().entries(ranges).finish()
+    }
+}
+
+impl Deref for Chunks {
+    type Target = BTreeMap<usize, Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Chunks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Downloaded chunks owned by both the reader and its background download task.
 ///
-/// The lock is held only while copying bytes. No reference to the mapping escapes a guard, so
-/// downloads can write new ranges without aliasing a long-lived shared slice.
+/// Each requested range grows one buffer as bytes arrive. This releases the HTTP buffers and keeps
+/// fragmented responses compact. Ranges do not overlap. The lock is never held across an await.
 #[derive(Debug)]
-struct SharedMemoryMap {
-    data: sync::Mutex<MmapMut>,
+struct SharedCache {
+    chunks: sync::Mutex<Chunks>,
+    /// The length of the remote file.
     len: usize,
 }
 
-impl SharedMemoryMap {
-    fn new(data: MmapMut) -> Self {
-        Self {
-            len: data.len(),
-            data: sync::Mutex::new(data),
+impl SharedCache {
+    fn new(len: u64) -> Result<Self, AsyncHttpRangeReaderError> {
+        // On 32-bit platforms, we only support files up to 4GB (the max of `Vec<u8>`).
+        let len = usize::try_from(len).map_err(|_| AsyncHttpRangeReaderError::FileTooLarge(len))?;
+        Ok(Self {
+            len,
+            chunks: sync::Mutex::new(Chunks::default()),
+        })
+    }
+
+    /// Create or add to a chunk starting at the given offset.
+    fn create_or_extend_chunk(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), AsyncHttpRangeReaderError> {
+        let Ok(mut chunks) = self.chunks.lock() else {
+            return Err(AsyncHttpRangeReaderError::LockPoisoned);
+        };
+        let _new_len = {
+            let entry = chunks.entry(offset).or_default();
+            entry.extend_from_slice(bytes);
+            entry.len()
+        };
+        // Check that the chunks are non-overlapping.
+        #[cfg(debug_assertions)]
+        {
+            if let Some((next_start, _)) = chunks
+                .range((
+                    std::ops::Bound::Excluded(offset),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+            {
+                assert!(offset + _new_len <= *next_start);
+            }
         }
+        Ok(())
+    }
+
+    /// Read a range of bytes known to be part of the storage.
+    ///
+    /// This includes reads across chunk boundaries.
+    fn read(&self, range: Range<usize>, buf: &mut ReadBuf<'_>) -> io::Result<()> {
+        let chunks = self
+            .chunks
+            .lock()
+            .map_err(|_| io::Error::other(AsyncHttpRangeReaderError::LockPoisoned))?;
+        let (&first_stored_start, _) = chunks
+            .range(..=range.start)
+            .next_back()
+            .expect("resident range must have a cached chunk");
+        let mut offset = range.start;
+        // Iterate over all chunks in the request range.
+        for (&start, bytes) in chunks.range(first_stored_start..range.end) {
+            let end = range.end.min(start + bytes.len());
+            buf.put_slice(&bytes[offset - start..end - start]);
+            offset = end;
+        }
+        assert_eq!(offset, range.end, "resident range must be fully cached");
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 struct Inner {
-    /// A shared view on the memory mapped data. The `downloaded_range` indicates the regions of
-    /// memory that contain bytes that have been downloaded.
-    data: Arc<SharedMemoryMap>,
+    /// Downloaded chunks shared with the background task. `resident_range` tracks their coverage.
+    data: Arc<SharedCache>,
 
     /// The current read position in the stream
     pos: u64,
@@ -130,7 +215,7 @@ struct Inner {
 
     /// A channel sender to send range requests to the background task
     ///
-    /// Contract: All ranges sent must be inside the range of the memory map
+    /// Contract: All ranges sent must be inside the file.
     request_tx: tokio::sync::mpsc::Sender<Range<u64>>,
 
     /// An optional object to reserve a slot in the `request_tx` sender. When in the process of
@@ -256,19 +341,7 @@ impl AsyncHttpRangeReader {
             _ => return Err(AsyncHttpRangeReaderError::HttpRangeRequestUnsupported),
         };
 
-        // Allocate a memory map to hold the data
-        let memory_map = usize::try_from(complete_length)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("file length of {complete_length} bytes cannot be represented on this platform"),
-                )
-            })
-            .and_then(MmapMut::map_anon)
-            .map_err(Arc::new)
-            .map_err(AsyncHttpRangeReaderError::MemoryMapError)?;
-
-        let memory_map = Arc::new(SharedMemoryMap::new(memory_map));
+        let data = Arc::new(SharedCache::new(complete_length)?);
 
         let requested_range = SparseRange::from_range(start..end_inclusive + 1);
 
@@ -283,7 +356,7 @@ impl AsyncHttpRangeReader {
             url,
             extra_headers,
             Some((response, start, end_inclusive + 1)),
-            Arc::clone(&memory_map),
+            Arc::clone(&data),
             state_tx,
             request_rx,
         ));
@@ -295,9 +368,9 @@ impl AsyncHttpRangeReader {
             .push(start..end_inclusive + 1);
 
         let reader = Self {
-            len: memory_map.len as u64,
+            len: data.len as u64,
             inner: Mutex::new(Inner {
-                data: memory_map,
+                data,
                 pos: 0,
                 requested_range,
                 streamer_state,
@@ -359,19 +432,7 @@ impl AsyncHttpRangeReader {
             .parse()
             .map_err(|_err| AsyncHttpRangeReaderError::ContentLengthMissing)?;
 
-        // Allocate a memory map to hold the data
-        let memory_map = usize::try_from(content_length)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("file length of {content_length} bytes cannot be represented on this platform"),
-                )
-            })
-            .and_then(MmapMut::map_anon)
-            .map_err(Arc::new)
-            .map_err(AsyncHttpRangeReaderError::MemoryMapError)?;
-
-        let memory_map = Arc::new(SharedMemoryMap::new(memory_map));
+        let data = Arc::new(SharedCache::new(content_length)?);
 
         let requested_range = SparseRange::default();
 
@@ -386,7 +447,7 @@ impl AsyncHttpRangeReader {
             url,
             extra_headers,
             None,
-            Arc::clone(&memory_map),
+            Arc::clone(&data),
             state_tx,
             request_rx,
         ));
@@ -395,9 +456,9 @@ impl AsyncHttpRangeReader {
         let streamer_state = StreamerState::default();
 
         let reader = Self {
-            len: memory_map.len as u64,
+            len: data.len as u64,
             inner: Mutex::new(Inner {
-                data: memory_map,
+                data,
                 pos: 0,
                 requested_range,
                 streamer_state,
@@ -452,7 +513,7 @@ async fn run_streamer(
     url: Url,
     extra_headers: HeaderMap,
     response: Option<(Response, u64, u64)>,
-    memory_map: Arc<SharedMemoryMap>,
+    data: Arc<SharedCache>,
     mut state_tx: Sender<StreamerState>,
     mut request_rx: tokio::sync::mpsc::Receiver<Range<u64>>,
 ) {
@@ -467,7 +528,7 @@ async fn run_streamer(
             response,
             start,
             end_exclusive,
-            &memory_map,
+            &data,
             &mut state_tx,
             &mut state,
         )
@@ -521,7 +582,7 @@ async fn run_streamer(
             };
 
             if let Err(err) =
-                validate_content_range(&response, *range.start(), *range.end(), memory_map.len)
+                validate_content_range(&response, *range.start(), *range.end(), data.len)
             {
                 state.error = Some(err);
                 let _ = state_tx.send(state);
@@ -540,7 +601,7 @@ async fn run_streamer(
                 response,
                 *range.start(),
                 *range.end() + 1,
-                &memory_map,
+                &data,
                 &mut state_tx,
                 &mut state,
             )
@@ -593,7 +654,7 @@ fn validate_content_range(
     Ok(())
 }
 
-/// Streams the data from the specified response to the memory map updating progress in between.
+/// Appends response chunks to the range's buffer, updating progress in between.
 /// Returns `true` if everything went fine, `false` if anything went wrong. The error state, if any,
 /// is stored in `state_tx` so the "frontend" will consume it.
 ///
@@ -602,16 +663,16 @@ async fn stream_response(
     tail_request_response: Response,
     start: u64,
     end_exclusive: u64,
-    memory_map: &SharedMemoryMap,
+    data: &SharedCache,
     state_tx: &mut Sender<StreamerState>,
     state: &mut StreamerState,
 ) -> bool {
     // Enforce request channel contract
     assert!(
-        end_exclusive <= memory_map.len as u64,
-        "end is outside of memory map {} > {}",
+        end_exclusive <= data.len as u64,
+        "end is outside of file {} > {}",
         end_exclusive,
-        memory_map.len
+        data.len
     );
 
     let mut offset = start;
@@ -626,14 +687,12 @@ async fn stream_response(
             Ok(bytes) => bytes,
         };
 
-        // Determine the range of these bytes in the complete file
-        let byte_range = offset..offset + bytes.len() as u64;
-
-        // Update the offset
-        offset += bytes.len() as u64;
+        if bytes.is_empty() {
+            continue;
+        }
 
         // Prevent the server from sending more bytes than advertised in a response
-        if offset > end_exclusive {
+        if bytes.len() as u64 > end_exclusive - offset {
             state.error = Some(AsyncHttpRangeReaderError::ResponseTooLong {
                 expected: end_exclusive - start,
             });
@@ -641,22 +700,20 @@ async fn stream_response(
             return false;
         }
 
-        // Copy the data from the stream to memory
-        {
-            let mut data = match memory_map.data.lock() {
-                Ok(data) => data,
-                Err(_) => {
-                    state.error = Some(AsyncHttpRangeReaderError::LockPoisoned);
-                    let _ = state_tx.send(state.clone());
-                    return false;
-                }
-            };
-            data[byte_range.start as usize..byte_range.end as usize]
-                .copy_from_slice(bytes.as_ref());
+        offset += bytes.len() as u64;
+
+        // Copy into one growing buffer as we go, reusing the same buffer through identical `start`.
+        match data.create_or_extend_chunk(start as usize, &bytes) {
+            Ok(()) => {}
+            Err(err) => {
+                state.error = Some(err);
+                let _ = state_tx.send(state.clone());
+                return false;
+            }
         }
 
         // Update the range of bytes that have been downloaded
-        state.resident_range.update(byte_range);
+        state.resident_range.update(start..offset);
 
         // Notify anyone that's listening that we have downloaded some extra data
         if state_tx.send(state.clone()).is_err() {
@@ -685,10 +742,11 @@ impl AsyncSeek for AsyncHttpRangeReader {
         let inner = me.inner.get_mut();
 
         inner.pos = match position {
-            SeekFrom::Start(pos) => pos,
-            SeekFrom::End(relative) => (inner.data.len as i64).saturating_add(relative) as u64,
-            SeekFrom::Current(relative) => (inner.pos as i64).saturating_add(relative) as u64,
-        };
+            SeekFrom::Start(pos) => Some(pos),
+            SeekFrom::End(relative) => (inner.data.len as u64).checked_add_signed(relative),
+            SeekFrom::Current(relative) => inner.pos.checked_add_signed(relative),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek position"))?;
 
         Ok(())
     }
@@ -714,7 +772,11 @@ impl AsyncRead for AsyncHttpRangeReader {
         }
 
         // Determine the range to be fetched
-        let range = inner.pos..(inner.pos + buf.remaining() as u64).min(inner.data.len as u64);
+        let range = inner.pos
+            ..inner
+                .pos
+                .saturating_add(buf.remaining() as u64)
+                .min(inner.data.len as u64);
         if range.start >= range.end {
             return Poll::Ready(Ok(()));
         }
@@ -752,17 +814,10 @@ impl AsyncRead for AsyncHttpRangeReader {
                 .resident_range
                 .is_covered(range.clone())
             {
-                let len = (range.end - range.start) as usize;
-                {
-                    let data =
-                        inner.data.data.lock().map_err(|_| {
-                            io::Error::other(AsyncHttpRangeReaderError::LockPoisoned)
-                        })?;
-                    buf.initialize_unfilled_to(len)
-                        .copy_from_slice(&data[range.start as usize..range.end as usize]);
-                }
-                buf.advance(len);
-                inner.pos += len as u64;
+                inner
+                    .data
+                    .read(range.start as usize..range.end as usize, buf)?;
+                inner.pos = range.end;
                 return Poll::Ready(Ok(()));
             }
 
@@ -807,6 +862,24 @@ mod test {
     use std::path::Path;
     use std::time::Duration;
     use tokio::io::AsyncReadExt as _;
+
+    #[test]
+    fn sparse_cache_reads_across_chunks() {
+        // A few bytes at the end of a huge file must not allocate storage for the holes.
+        let cache = SharedCache::new(isize::MAX as u64).unwrap();
+        let start = cache.len - 16;
+        cache.create_or_extend_chunk(start + 8, b"89ab").unwrap();
+        cache.create_or_extend_chunk(0, b"other range").unwrap();
+        cache.create_or_extend_chunk(start, b"0123").unwrap();
+        cache.create_or_extend_chunk(start + 4, b"4567").unwrap();
+
+        let mut output = [b'?'; 10];
+        let mut buf = ReadBuf::new(&mut output);
+        buf.put_slice(b">");
+        cache.read(start + 2..start + 10, &mut buf).unwrap();
+        assert_eq!(buf.filled(), b">23456789");
+        assert_eq!(&output, b">23456789?");
+    }
 
     #[tokio::test]
     async fn closed_download_stream_returns_terminal_error() {
@@ -1048,50 +1121,6 @@ mod test {
         );
     }
 
-    #[rstest]
-    #[case(CheckSupportMethod::Head)]
-    #[case(CheckSupportMethod::NegativeRangeRequest(1))]
-    #[tokio::test]
-    async fn test_file_length_too_large(
-        #[case] check_method: CheckSupportMethod,
-        #[values(1_u64 << 63, (1_u64 << 63) + 1)] length: u64,
-    ) {
-        // Neither length can be mapped on any platform.
-        let response = axum::http::Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::CONTENT_RANGE, format!("bytes 0-0/{length}"))
-            .body("")
-            .unwrap()
-            .into();
-        let client = Client::new();
-        let url = Url::parse("http://localhost/file").unwrap();
-        let err = match check_method {
-            CheckSupportMethod::Head => {
-                AsyncHttpRangeReader::from_head_response(
-                    client,
-                    response,
-                    url,
-                    HeaderMap::default(),
-                )
-                .await
-            }
-            CheckSupportMethod::NegativeRangeRequest(_) => {
-                AsyncHttpRangeReader::from_range_response(
-                    client,
-                    response,
-                    url,
-                    HeaderMap::default(),
-                )
-                .await
-            }
-        }
-        .unwrap_err();
-
-        assert_matches!(err, AsyncHttpRangeReaderError::MemoryMapError(_));
-    }
-
     /// Spawn a server where the HEAD response reports `head_size` bytes, and range requests always
     /// claim to be `pretend_size` bytes, while actually serving `actual_size`.
     async fn spawn_mismatch_server(
@@ -1149,8 +1178,7 @@ mod test {
         Url::parse(&format!("http://localhost:{}/file", local_addr.port())).unwrap()
     }
 
-    /// HEAD says 512 bytes, but range responses return 1024 bytes — overflows
-    /// the memory map.
+    /// HEAD says 512 bytes, but range responses return 1024 bytes, beyond the file's end.
     #[tokio::test]
     async fn test_content_length_response_beyond_content_length() {
         /// Extract the [`AsyncHttpRangeReaderError`] from an `io::Error` returned by `read`.

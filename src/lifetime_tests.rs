@@ -6,7 +6,6 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use axum::extract::Request;
 use axum::response::IntoResponse;
-use memmap2::MmapOptions;
 use reqwest::header::HeaderMap;
 use reqwest::{header, Client, Method, StatusCode, Url};
 use rstest::rstest;
@@ -18,7 +17,7 @@ use tokio_stream::wrappers::WatchStream;
 use crate::sparse_range::SparseRange;
 use crate::{
     run_streamer, AsyncHttpRangeReader, AsyncHttpRangeReaderError, CheckSupportMethod, Inner,
-    SharedMemoryMap, StreamerState,
+    SharedCache, StreamerState,
 };
 
 /// Serve `bytes=0-3` and `bytes=-4`, returning HTTP 500 for other ranges.
@@ -116,8 +115,8 @@ async fn cached_range_survives_failed_prefetch(
 #[tokio::test]
 async fn cached_range_survives_streamer_cancellation() -> Result<(), Box<dyn Error>> {
     let url = spawn_failing_range_server().await?;
-    let memory_map = Arc::new(SharedMemoryMap::new(MmapOptions::new().len(16).map_anon()?));
-    let weak_mapping = Arc::downgrade(&memory_map);
+    let data = Arc::new(SharedCache::new(16)?);
+    let weak_data = Arc::downgrade(&data);
     let (request_tx, request_rx) = mpsc::channel(10);
     let (state_tx, state_rx) = watch::channel(StreamerState::default());
     let streamer = tokio::spawn(run_streamer(
@@ -125,14 +124,14 @@ async fn cached_range_survives_streamer_cancellation() -> Result<(), Box<dyn Err
         url,
         HeaderMap::new(),
         None,
-        Arc::clone(&memory_map),
+        Arc::clone(&data),
         state_tx,
         request_rx,
     ));
     let mut reader = AsyncHttpRangeReader {
-        len: memory_map.len as u64,
+        len: data.len as u64,
         inner: Mutex::new(Inner {
-            data: memory_map,
+            data,
             pos: 0,
             requested_range: SparseRange::default(),
             streamer_state: StreamerState::default(),
@@ -151,13 +150,13 @@ async fn cached_range_survives_streamer_cancellation() -> Result<(), Box<dyn Err
         .await
         .expect_err("the download task must have been cancelled");
     assert!(cancellation.is_cancelled());
-    assert!(weak_mapping.upgrade().is_some());
+    assert!(weak_data.upgrade().is_some());
 
     reader.seek(SeekFrom::Start(0)).await?;
     reader.read_exact(&mut contents).await?;
     assert_eq!(&contents, b"safe");
 
     drop(reader);
-    assert!(weak_mapping.upgrade().is_none());
+    assert!(weak_data.upgrade().is_none());
     Ok(())
 }
