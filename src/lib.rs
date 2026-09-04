@@ -141,8 +141,12 @@ impl SharedCache {
         })
     }
 
-    /// Add a chunk of bytes starting at the given offset.
-    fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), AsyncHttpRangeReaderError> {
+    /// Create or add to a chunk starting at the given offset.
+    fn create_or_extend_chunk(
+        &self,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), AsyncHttpRangeReaderError> {
         let Ok(mut chunks) = self.chunks.lock() else {
             return Err(AsyncHttpRangeReaderError::LockPoisoned);
         };
@@ -682,7 +686,7 @@ async fn stream_response(
         offset += bytes.len() as u64;
 
         // Copy into one growing buffer as we go, reusing the same buffer through identical `start`.
-        match data.write(start as usize, &bytes) {
+        match data.create_or_extend_chunk(start as usize, &bytes) {
             Ok(()) => {}
             Err(err) => {
                 state.error = Some(err);
@@ -847,10 +851,10 @@ mod test {
         // A few bytes at the end of a huge file must not allocate storage for the holes.
         let cache = SharedCache::new(isize::MAX as u64).unwrap();
         let start = cache.len - 16;
-        cache.write(start + 8, b"89ab").unwrap();
-        cache.write(0, b"other range").unwrap();
-        cache.write(start, b"0123").unwrap();
-        cache.write(start + 4, b"4567").unwrap();
+        cache.create_or_extend_chunk(start + 8, b"89ab").unwrap();
+        cache.create_or_extend_chunk(0, b"other range").unwrap();
+        cache.create_or_extend_chunk(start, b"0123").unwrap();
+        cache.create_or_extend_chunk(start + 4, b"4567").unwrap();
 
         let mut output = [b'?'; 10];
         let mut buf = ReadBuf::new(&mut output);
