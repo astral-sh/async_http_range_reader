@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/astral-sh/async_http_range_reader/compare/v0.11.1...v0.12.0) - 2026-09-04
+
+### Other
+
+- Use owned buffers for the range cache ([#23](https://github.com/astral-sh/async_http_range_reader/pull/23))
+- Exclude `release-plz.toml` from published crates ([#19](https://github.com/astral-sh/async_http_range_reader/pull/19))
+- Update astral_async_zip dev-dependency to 0.0.21 ([#24](https://github.com/astral-sh/async_http_range_reader/pull/24))
+
 ## [0.11.1](https://github.com/astral-sh/async_http_range_reader/compare/v0.11.0...v0.11.1) - 2026-09-01
 
 ### Other
