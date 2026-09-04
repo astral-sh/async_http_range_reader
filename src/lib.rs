@@ -150,7 +150,24 @@ impl SharedCache {
         let Ok(mut chunks) = self.chunks.lock() else {
             return Err(AsyncHttpRangeReaderError::LockPoisoned);
         };
-        chunks.entry(offset).or_default().extend_from_slice(bytes);
+        let _new_len = {
+            let entry = chunks.entry(offset).or_default();
+            entry.extend_from_slice(bytes);
+            entry.len()
+        };
+        // Check that the chunks are non-overlapping.
+        #[cfg(debug_assertions)]
+        {
+            if let Some((next_start, _)) = chunks
+                .range((
+                    std::ops::Bound::Excluded(offset),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+            {
+                assert!(offset + _new_len <= *next_start);
+            }
+        }
         Ok(())
     }
 
